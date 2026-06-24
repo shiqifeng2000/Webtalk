@@ -15,7 +15,7 @@ WebTalk is a full-featured real-time media streaming and conferencing framework 
 
 ## 📡 HTTP Distribution
 
-To simplify stream pulling, WebTalk provides an **ES (Elementary Stream) mode** that converts WebRTC streams into raw audio/video data over HTTP.
+To simplify stream pulling, WebTalk provides an **ES (Elementary Stream) mode** that converts WebRTC streams into raw audio/video data over HTTP or vice versa.
 
 ### 1. HTTP Pull Streaming
 
