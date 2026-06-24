@@ -1,0 +1,423 @@
+<html>
+
+<head></head>
+<style>
+  textarea {
+    width: 500px;
+    min-height: 75px;
+  }
+
+  video {
+    max-width: 40vw;
+    height: auto;
+  }
+
+  .channel {
+    font-weight: bold;
+  }
+</style>
+
+<body>
+  <!-- Browser base64 Session Description<br />
+  <textarea id="localSessionDescription" readonly="true"></textarea> <br />
+
+  Golang base64 Session Description<br />
+  <textarea id="remoteSessionDescription"> </textarea> <br /> -->
+  <!-- <button onclick="window.startSession()">注册</button><br /> -->
+
+  <!-- <br /> -->
+
+  Video<br />
+  <div id="localVideos"></div>
+  <div id="remoteVideos"></div>
+  <br />
+
+  操作区
+  <form onsubmit="return sendMessage()">
+    <input id="target" />
+    <button type="button" onclick="return getSessions()" id="queryBtn">查询频道</button>
+    <button type="button" onclick="return startSession()" id="publishBtn">发布频道</button>
+    <button type="button" onclick="return subscribeSession()" id="subscribeBtn">注册频道</button>
+  </form>
+  消息区<br />
+  <input id="data_input" />
+  <button type="button" id="messager">发消息</button>
+
+  当前会话<br />
+  <div id="channel" class="channel"></div>
+  已发布会话<br />
+  <div id="sessions"></div>
+  <br />
+
+  Logs<br />
+  <div id="div"></div>
+</body>
+<script src="/md5.min.js?TOKEN=webtalk"></script>
+<script>
+  const TOKEN = "webtalk";
+  const targetInput = document.getElementById("target");
+  const publishBtn = document.getElementById("publishBtn");
+  const subscribeBtn = document.getElementById("subscribeBtn");
+  const dataInput = document.getElementById("data_input");
+  const messageBtn = document.getElementById("messager");
+  let channelId = null;
+  let target = null;
+  let sessions = {};
+  let inter = null;
+
+  let log = (msg) => {
+    document.getElementById("div").innerHTML += msg + "<br>";
+  };
+
+  window.getSessions = async () => {
+    let timestamp = Date.now();
+    const md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    fetch(`/sessions`, {
+      method: "get",
+      headers: {
+        "Content-Type": "application/json",
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+      // body: JSON.stringify({
+      //   peer: btoa(JSON.stringify(d)),
+      // }),
+    })
+      .then((res) => res.json())
+      .then((body) => {
+        if (body.success) {
+          if (sessions.length == body.sessions.length) {
+            let ls_diff = false;
+            let rs_diff = false;
+            for (let ls of Object.keys(sessions)) {
+              if (!body.sessions.hasOwnProperty(ls)) {
+                ls_diff = true;
+                break;
+              }
+            }
+            if (!ls_diff) {
+              for (let rs of Object.keys(body.sessions)) {
+                if (!sessions.hasOwnProperty(rs)) {
+                  rs_diff = true;
+                  break;
+                }
+              }
+            }
+            if (ls_diff || rs_diff) {
+              sessions = body.sessions;
+              document.getElementById("sessions").innerHTML = Object.keys(sessions).join(", ");
+            }
+          } else {
+            sessions = body.sessions;
+            document.getElementById("sessions").innerHTML = Object.keys(sessions).join(", ");
+          }
+        }
+      })
+      .catch(log);
+  }
+
+  window.startSession = async () => {
+    let localStream = await navigator.mediaDevices.getDisplayMedia({
+      // 可以用navigator.mediaDevices.getUserMedia从麦克风采集音频流
+      audio: true,
+      video: true,
+      // video: { 'mandatory': { 'chromeMediaSource': 'screen' } }
+      // video: { 'chromeMediaSource': 'screen' }
+    });
+    var el0 = document.createElement("video");
+    el0.autoplay = true;
+    el0.controls = true;
+    el0.muted = true;
+    el0.srcObject = localStream;
+    document.getElementById("localVideos").appendChild(el0);
+    /* eslint-env browser */
+    let pc = new RTCPeerConnection({
+      iceServers: [
+        {
+          // urls: "stun:stun.l.google.com:19302",
+          urls: `stun:${window.location.hostname}:31401`,
+          // urls: "stun:101.200.144.99:31401"
+          // urls: "stun:192.168.0.100:9003",
+        },
+      ],
+    });
+
+    localStream.getTracks().forEach(track => {
+      track.contentHint = "detail";
+      pc.addTrack(track, localStream);
+    });
+    // pc.ontrack = function (event) {
+    //   // var el = document.createElement(event.track.kind);
+    //   // el.srcObject = event.streams[0];
+    //   // el.autoplay = true;
+    //   // el.controls = true;
+    //   mediaStream.addTrack(event.track);
+    // };
+
+    pc.oniceconnectionstatechange = (e) => log(pc.iceConnectionState);
+    // let candidatePromise = new Promise((resolve, reject) => {
+    // });
+
+    let localCandidates = [];
+    let candidatePromise = new Promise((res) => {
+      pc.onicecandidate = (e) => {
+        if (e.candidate === null) {
+          // document.getElementById("localSessionDescription").value = btoa(
+          //   JSON.stringify(pc.localDescription)
+          // );
+          // console.log(pc.localDescription);
+          localCandidates.push(null);
+          res(localCandidates);
+        } else {
+          let message = {};
+          message.candidate = e.candidate.candidate;
+          message.sdpMid = e.candidate.sdpMid;
+          message.sdpMLineIndex = e.candidate.sdpMLineIndex;
+          message.usernameFragment = e.candidate.usernameFragment;
+          localCandidates.push(message);
+        }
+        console.log(e);
+      };
+      setTimeout(() => { res(localCandidates) }, 2000);
+    });
+
+
+    // Offer to receive 1 audio, and 1 video track
+    pc.addTransceiver("video", { direction: "sendrecv" });
+    pc.addTransceiver("audio", { direction: "sendrecv" });
+    let sendChannel = pc.createDataChannel('command')
+    sendChannel.onclose = () => console.log('sendChannel has closed')
+    sendChannel.onopen = () => console.log('sendChannel has opened')
+    sendChannel.onmessage = (e) => {
+      dataInput.value = new TextDecoder("utf-8").decode(e.data);
+    }
+
+    let d = await pc.createOffer();
+    console.log(d.sdp);
+    await pc.setLocalDescription(d);
+    await candidatePromise;
+
+    let timestamp = Date.now()
+    const md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    let body = await fetch(`/publish`, {
+      method: "post",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+      body: JSON.stringify({
+        // sockets: 3,
+        candidates: localCandidates,
+        peer: btoa(JSON.stringify(d)),
+      }),
+    })
+      .then((res) => res.json())
+      .catch(log);
+
+    if (body.success) {
+      try {
+        let sdp = JSON.parse(atob(body.data));
+        channelId = body.sid;
+        document.getElementById("channel").innerHTML = channelId;
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        console.log(sdp);
+
+        // for (let candidate of body.candidates) {
+        //   pc.addIceCandidate(candidate);
+        // }
+        subscribeBtn.disabled = true;
+      } catch (e) {
+        alert(e);
+      }
+    }
+
+
+    if (!window.pc) {
+      window.pc = pc;
+    } else {
+      window.pc.close();
+    }
+  }
+
+  window.subscribeSession = async () => {
+    target = Number.parseInt(targetInput.value);
+    if (!target || !sessions.hasOwnProperty(target)) {
+      let keys = Object.keys(sessions);
+      if (keys.length > 0) {
+        target = Number.parseInt(keys[0]);
+        targetInput.value = target;
+      } else {
+        return;
+      }
+    }
+
+    var el = document.createElement("video");
+    el.autoplay = true;
+    el.controls = true;
+    let mediaStream = new MediaStream();
+    el.srcObject = mediaStream;
+    document.getElementById("remoteVideos").appendChild(el);
+
+    /* eslint-env browser */
+    let pc = new RTCPeerConnection({
+      iceServers: [
+        {
+          // urls: "stun:stun.l.google.com:19302",
+          urls: `stun:${window.location.hostname}:31401`,
+          // urls: "stun:192.168.0.100:9003",
+        },
+      ],
+    });
+
+    // localStream.getTracks().forEach(track => {
+    //   track.contentHint = "detail";
+    //   pc.addTrack(track, localStream);
+    // });
+    pc.ontrack = function (event) {
+      mediaStream.addTrack(event.track);
+    };
+
+    pc.oniceconnectionstatechange = (e) => log(pc.iceConnectionState);
+    // let candidatePromise = new Promise((resolve, reject) => {
+    // });
+    let localCandidates = [];
+    let candidatePromise = new Promise((res) => {
+      pc.onicecandidate = (e) => {
+        if (e.candidate === null) {
+          // document.getElementById("localSessionDescription").value = btoa(
+          //   JSON.stringify(pc.localDescription)
+          // );
+          // console.log(pc.localDescription);
+          localCandidates.push(null);
+          res(localCandidates);
+        } else {
+          let message = {};
+          message.candidate = e.candidate.candidate;
+          message.sdpMid = e.candidate.sdpMid;
+          message.sdpMLineIndex = e.candidate.sdpMLineIndex;
+          message.usernameFragment = e.candidate.usernameFragment;
+          localCandidates.push(message);
+        }
+        console.log(e);
+      };
+      setTimeout(() => { res(localCandidates) }, 10000);
+    });
+
+
+    // Offer to receive 1 audio, and 1 video track
+    pc.addTransceiver("video", { direction: "sendrecv" });
+    pc.addTransceiver("audio", { direction: "sendrecv" });
+    let sendChannel = pc.createDataChannel('command')
+    sendChannel.onclose = () => console.log('sendChannel has closed')
+    sendChannel.onopen = () => console.log('sendChannel has opened')
+    messageBtn.onclick = () => {
+      if (dataInput.value) {
+        sendChannel.send(dataInput.value);
+      }
+    }
+
+    let d = await pc.createOffer();
+    console.log(d.sdp);
+    await pc.setLocalDescription(d);
+    await candidatePromise;
+
+    let timestamp = Date.now()
+    const md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    fetch(`/subscribe`, {
+      method: "post",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+      body: JSON.stringify({
+        // sockets: 3,
+        target,
+        candidates: localCandidates,
+        peer: btoa(JSON.stringify(d)),
+      }),
+    })
+      .then((res) => res.json())
+      .then((body) => {
+        if (body.success) {
+          try {
+            let sdp = JSON.parse(atob(body.data));
+            channelId = body.sid;
+            document.getElementById("channel").innerHTML = "接收者";
+            pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            console.log(sdp);
+
+            // for (let candidate of body.candidates) {
+            //   pc.addIceCandidate(candidate);
+            // }
+            publishBtn.disabled = true;
+          } catch (e) {
+            alert(e);
+          }
+        }
+      })
+      .catch(log);
+
+    if (!window.pc) {
+      window.pc = pc;
+    } else {
+      window.pc.close();
+    }
+  }
+
+  // window.subscribeSession = async () => {
+  //   target = Number.parseInt(targetInput.value);
+  //   if (!target || !sessions.hasOwnProperty(target)) {
+  //     alert("Target number invalid");
+  //     return;
+  //   }
+  //   if (!channelId) {
+  //     alert("lack local stream id");
+  //     return;
+  //   }
+  //   fetch(`/subscribe`, {
+  //     method: "post",
+  //     headers: {
+  //       Accept: "application/json, text/plain, */*",
+  //       "Content-Type": "application/json",
+  //     },
+  //     body: JSON.stringify({
+  //       id: channelId,
+  //       target
+  //     }),
+  //   })
+  //     .then((res) => res.json())
+  //     .then((body) => {
+  //       if (!body.success) {
+  //         log(JSON.stringify(body));
+  //       }
+  //     })
+  //     .catch(log);
+  // }
+
+  // inter = setInterval(window.getSessions, 10000);
+
+  // pc.createOffer()
+  //   .then((d) => pc.setLocalDescription(d))
+  //   .catch(log);
+
+  // window.startSession = () => {
+  //   let sd = document.getElementById("remoteSessionDescription").value;
+  //   if (sd === "") {
+  //     return alert("Session Description must not be empty");
+  //   }
+
+  //   try {
+  //     pc.setRemoteDescription(
+  //       new RTCSessionDescription(JSON.parse(atob(sd)))
+  //     );
+  //   } catch (e) {
+  //     alert(e);
+  //   }
+  // };
+</script>
+
+</html>

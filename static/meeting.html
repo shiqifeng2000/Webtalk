@@ -1,0 +1,696 @@
+<html>
+
+<head></head>
+<style>
+  textarea {
+    width: 500px;
+    min-height: 75px;
+  }
+
+  /* section {
+    font-size: 0;
+  } */
+
+  section video {
+    /* width: 100%; */
+    width: 50%;
+    max-width: 80%;
+    height: 40%;
+    object-fit: scale-down;
+  }
+
+  body {
+    padding: 0;
+    margin: 0;
+  }
+</style>
+
+<body>
+  <!-- Browser base64 Session Description<br />
+    <textarea id="localSessionDescription" readonly="true"></textarea> <br />
+
+    Golang base64 Session Description<br />
+    <textarea id="remoteSessionDescription"> </textarea> <br />
+    <button onclick="window.startSession()">Start Session</button><br />
+
+    <br /> -->
+
+  <!-- <video id="remoteVideos" autoplay muted controls style="width: 100%; height: 50%px"></video> -->
+  <section id="section">
+    <h4>本地音视频</h4>
+    <div id="localVideos"></div>
+    <br />
+    <h4>远端音视频</h4>
+    <div id="remoteVideos"></div>
+    <br />
+    <!-- <video id="remoteVideos" autoplay muted controls></video> -->
+  </section>
+  <br />
+  <!-- <video id="test" controls muted></video> -->
+  Message<br />
+  <!-- <form onsubmit="return sendMessage()"> -->
+  <form>
+    RoomSession<br />
+    <input id="target" />
+    <br />
+    Attender<br />
+    <input id="attender" />
+    <br />
+    <br />
+    <button type="button" onclick="return getSessions()" id="queryBtn">查询会议</button>
+    <button type="button" onclick="return createSession(true)">新建会议</button>
+    <button type="button" onclick="return createSession(false)">加入会议</button>
+    <button type="button" onclick="return createSession(false, true)">加入会议(仅音频)</button>
+    <button type="button" onclick="return resumeSession()">续连会话</button>
+    <button type="button" onclick="return stopSession()">终止会话</button>
+    <!-- <br />
+    <button type="button" onclick="return pullSession()">会话拉流</button> -->
+  </form>
+  已发布会话<br />
+  <div id="sessionsLog"></div>
+
+  Logs<br />
+  <div id="status"></div>
+  <div id="debug"></div>
+</body>
+<script src="./md5.min.js?TOKEN=webtalk"></script>
+<script src="./helper.js?TOKEN=webtalk"></script>
+<script>
+  let start_time = Date.now();
+  const TOKEN = "webtalk";
+  const targetInput = document.getElementById("target");
+  const attenderInput = document.getElementById("attender");
+  const section = document.getElementById("section");
+  const videoCodec = "avc1.4D402A";
+  const codedWidth = 1920;
+  const codedHeight = 1080;
+  const audioCodec = "opus";
+  const codedSampleRate = 48000;
+  const codedChannels = 2;
+  let sessions = {};
+  let playingMedias = {};
+  let localMedias = {};
+  let sid = null;
+  let mid = null;
+
+  let log = (msg) => {
+    document.getElementById("debug").innerHTML += msg + "<br>";
+  };
+
+  let localClientStreamer = async (audio_only) => {
+    // let method = is_host ? "getDisplayMedia" : "getUserMedia";
+    let constrain = {
+      audio: { sampleRate: codedSampleRate, channelCount: codedChannels },
+    };
+    if (!audio_only) {
+      constrain.video = { width: codedWidth, height: codedHeight };
+    }
+    let localStream = await navigator.mediaDevices.getUserMedia(constrain);
+    var el = document.createElement("video");
+    el.autoplay = true;
+    el.controls = true;
+    el.srcObject = localStream;
+    document.getElementById("localVideos").appendChild(el);
+
+    let uploader = null;
+    let readableStream = new ReadableStream({
+      start: (controller) => {
+        uploader = controller;
+      },
+      pull: async (controller) => {
+        // This will be called when the consumer wants more data
+        // We'll handle pushing data manually
+      },
+      cancel: () => {
+        console.log('Stream cancelled');
+        uploader = null;
+      }
+    });
+
+    let videoReader = null;
+    let audioReader = null;
+    localStream.getTracks().forEach(track => {
+      track.contentHint = "detail";
+      const trackProcessor = new MediaStreamTrackProcessor(track);
+      if (track.kind === "video") {
+        videoReader = trackProcessor.readable;
+        localMedias.videoTrack = track;
+      } else if (track.kind === "audio") {
+        audioReader = trackProcessor.readable;
+        localMedias.audioTrack = track;
+      }
+    });
+
+
+    if (window.videoPushWorker) {
+      window.videoPushWorker.terminate();
+    }
+    if (window.audioPushWorker) {
+      window.audioPushWorker.terminate();
+    }
+
+    if (videoReader) {
+      window.videoPushWorker = new Worker("./push.worker.video.js?TOKEN=webtalk");
+      const config = {
+        codec: videoCodec,
+        width: codedWidth,
+        height: codedHeight,
+        framerate: 30,
+        keyInterval: 60,
+        avc: { format: "annexb" }
+      };
+      // if (uploader) {
+      //   uploader.enqueue(genVideoConfiguration(
+      //     TOKEN, mid, codedWidth, codedHeight, videoCodec
+      //   ));
+      // }
+      // vcnf = uint8ToBase64(genVideoConfiguration(
+      //   TOKEN, mid, codedWidth, codedHeight, videoCodec
+      // ));
+      window.videoPushWorker.postMessage({ config: config, input: videoReader, type: "start" }, [videoReader]);
+      window.videoPushWorker.addEventListener('message', (e) => {
+        if (e.data.severity) {
+          btoa;
+          console.error(e.data.text);
+        } else if (e.data.type === "data" && uploader) {
+          const buffer = new ArrayBuffer(e.data.data.byteLength + 1);
+          const view = new DataView(buffer);
+          view.setUint8(0, e.data.data.type === "key" ? 1 : 0, false);
+          // console.log("video key", e.data.data.type === "key");
+          const payload = new Uint8Array(buffer, 1);
+          e.data.data.copyTo(payload);  // Copy chunk data to ArrayBuffer
+          let boxdata = new Uint8Array(buffer);
+          uploader.enqueue(genBox(TOKEN, mid, "vfrm", boxdata));
+        }
+      });
+    }
+
+    if (audioReader) {
+      window.audioPushWorker = new Worker("./push.worker.audio.js?TOKEN=webtalk");
+      const config = {
+        codec: audioCodec,
+        sampleRate: codedSampleRate,
+        numberOfChannels: codedChannels
+      };
+      acnf = uint8ToBase64(genAudioConfiguration(
+        TOKEN, mid, codedSampleRate, codedChannels, audioCodec
+      ));
+      window.audioPushWorker.postMessage({ config: config, input: audioReader, type: "start" }, [audioReader]);
+      window.audioPushWorker.addEventListener('message', (e) => {
+        if (e.data.severity) {
+          console.error(e.data.text);
+        } else if (e.data.type === "data" && uploader) {
+          const buffer = new ArrayBuffer(e.data.data.byteLength);
+          const payload = new Uint8Array(buffer);
+          e.data.data.copyTo(payload);  // Copy chunk data to ArrayBuffer
+          uploader.enqueue(genBox(TOKEN, mid, "afrm", payload));
+        }
+      });
+    }
+    return readableStream;
+  }
+  let localHostStreamer = async () => {
+    let localDisplayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: codedWidth, height: codedHeight }
+    });
+    var el = document.createElement("video");
+    el.autoplay = true;
+    el.controls = true;
+    el.srcObject = localDisplayStream;
+    document.getElementById("localVideos").appendChild(el);
+
+    let localUserStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: codedSampleRate, channelCount: codedChannels }
+    });
+    var el1 = document.createElement("audio");
+    el1.autoplay = true;
+    el1.controls = true;
+    el1.srcObject = localUserStream;
+    document.getElementById("localVideos").appendChild(el1);
+
+    let uploader = null;
+    let readableStream = new ReadableStream({
+      start: (controller) => {
+        uploader = controller;
+      },
+      pull: async (controller) => {
+        // This will be called when the consumer wants more data
+        // We'll handle pushing data manually
+      },
+      cancel: () => {
+        console.log('Stream cancelled');
+        uploader = null;
+      }
+    });
+
+    let videoReader = null;
+    let audioReader = null;
+    localDisplayStream.getTracks().forEach(track => {
+      track.contentHint = "detail";
+      const trackProcessor = new MediaStreamTrackProcessor(track);
+      if (track.kind === "video") {
+        videoReader = trackProcessor.readable;
+        localMedias.videoTrack = track;
+      }
+    });
+    localUserStream.getTracks().forEach(track => {
+      track.contentHint = "detail";
+      const trackProcessor = new MediaStreamTrackProcessor(track);
+      if (track.kind === "audio") {
+        audioReader = trackProcessor.readable;
+        localMedias.audioTrack = track;
+      }
+    });
+
+    if (window.videoPushWorker) {
+      window.videoPushWorker.terminate();
+    }
+    if (window.audioPushWorker) {
+      window.audioPushWorker.terminate();
+    }
+
+    if (videoReader) {
+      window.videoPushWorker = new Worker("./push.worker.video.js?TOKEN=webtalk");
+      const config = {
+        codec: videoCodec,
+        width: codedWidth,
+        height: codedHeight,
+        framerate: 30,
+        keyInterval: 60,
+        avc: { format: "annexb" }
+      };
+      // if (uploader) {
+      //   uploader.enqueue(genVideoConfiguration(
+      //     TOKEN, mid, codedWidth, codedHeight, videoCodec
+      //   ));
+      // }
+      // vcnf = uint8ToBase64(genVideoConfiguration(
+      //   TOKEN, mid, codedWidth, codedHeight, videoCodec
+      // ));
+      window.videoPushWorker.postMessage({ config: config, input: videoReader, type: "start" }, [videoReader]);
+      window.videoPushWorker.addEventListener('message', (e) => {
+        if (e.data.severity) {
+          btoa;
+          console.error(e.data.text);
+        } else if (e.data.type === "data" && uploader) {
+          const buffer = new ArrayBuffer(e.data.data.byteLength + 1);
+          const view = new DataView(buffer);
+          view.setUint8(0, e.data.data.type === "key" ? 1 : 0, false);
+          // console.log("video key", e.data.data.type === "key");
+          const payload = new Uint8Array(buffer, 1);
+          e.data.data.copyTo(payload);  // Copy chunk data to ArrayBuffer
+          let boxdata = new Uint8Array(buffer);
+          uploader.enqueue(genBox(TOKEN, mid, "vfrm", boxdata));
+        }
+      });
+    }
+
+    if (audioReader) {
+      window.audioPushWorker = new Worker("./push.worker.audio.js?TOKEN=webtalk");
+      const config = {
+        codec: audioCodec,
+        sampleRate: codedSampleRate,
+        numberOfChannels: codedChannels
+      };
+      acnf = uint8ToBase64(genAudioConfiguration(
+        TOKEN, mid, codedSampleRate, codedChannels, audioCodec
+      ));
+      window.audioPushWorker.postMessage({ config: config, input: audioReader, type: "start" }, [audioReader]);
+      window.audioPushWorker.addEventListener('message', (e) => {
+        if (e.data.severity) {
+          console.error(e.data.text);
+        } else if (e.data.type === "data" && uploader) {
+          const buffer = new ArrayBuffer(e.data.data.byteLength);
+          const payload = new Uint8Array(buffer);
+          e.data.data.copyTo(payload);  // Copy chunk data to ArrayBuffer
+          uploader.enqueue(genBox(TOKEN, mid, "afrm", payload));
+        }
+      });
+    }
+    return readableStream;
+  }
+
+  let remoteStreamer = async () => {
+    if (!sid) {
+      let target = Number.parseInt(targetInput.value);
+      if (target.toString() !== "NaN") {
+        sid = target;
+      }
+    }
+    if (!mid) {
+      let attender = Number.parseInt(attenderInput.value);
+      if (attender.toString() !== "NaN") {
+        mid = attender;
+      }
+    }
+    let timestamp = Date.now();
+    let md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    const response = await fetch(`./http_conf/downstream/${sid}/${mid}`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    window.mediaPullWorker = new Worker("./pull.worker.media.js?TOKEN=webtalk");
+    window.mediaPullWorker.addEventListener('message', (e) => {
+      if (e.data.severity) {
+        console.error(e.data.text);
+      } else if (e.data.type === "new") {
+        let ssrc = e.data.ssrc;
+        let containerId = `remote_${ssrc}`;
+        let container = document.getElementById(containerId);
+        if (!container) {
+          let wrapper = document.createElement("div");
+          wrapper.id = containerId;
+          document.getElementById("remoteVideos").appendChild(wrapper);
+          let label = document.createElement("h5");
+          label.innerHTML = `参会人${ssrc}`;
+          wrapper.appendChild(label);
+          if (!playingMedias[ssrc]) {
+            playingMedias[ssrc] = {}
+          }
+        }
+        container = document.getElementById(containerId);
+        if (e.data.kind == "acnf") {
+          let audio = document.createElement("audio");
+          audio.id = `remote_${ssrc}_audio`;
+          audio.autoplay = true;
+          audio.controls = true;
+          container.appendChild(audio);
+          let audioTrackGenerator = new MediaStreamTrackGenerator({ kind: "audio" });
+          let remoteStream = new MediaStream([audioTrackGenerator]);
+          remoteStream.getTracks().forEach(track => {
+            if (playingMedias[ssrc]) {
+              playingMedias[ssrc].audioTrack = track;
+            }
+          });
+          audio.srcObject = remoteStream;
+          // audio.onplay = () => {
+          //   log(`audio timecost ${Date.now() - start_time}`)
+          // }
+          let audioWritable = audioTrackGenerator.writable;
+          window.mediaPullWorker.postMessage({ ssrc, audioWritable, type: "register" }, [audioWritable]);
+        } else if (e.data.kind == "vcnf") {
+          let video = document.createElement("video");
+          video.id = `remote_${ssrc}_video`;
+          video.autoplay = true;
+          video.controls = true;
+          container.appendChild(video);
+          let videoTrackGenerator = new MediaStreamTrackGenerator({ kind: "video" });
+          let remoteStream = new MediaStream([videoTrackGenerator]);
+          remoteStream.getTracks().forEach(track => {
+            if (playingMedias[ssrc]) {
+              playingMedias[ssrc].videoTrack = track;
+            }
+          });
+          video.srcObject = remoteStream;
+          // video.onplay = () => {
+          //   log(`video timecost ${Date.now() - start_time}`)
+          // }
+          let videoWritable = videoTrackGenerator.writable;
+          window.mediaPullWorker.postMessage({ ssrc, videoWritable, type: "register" }, [videoWritable]);
+        }
+      } else if (e.data.type === "del") {
+        let id = `remote_${e.data.ssrc}`;
+        let video = document.getElementById(id);
+        if (video) {
+          video.parentElement.removeChild(video);
+        }
+      }
+    });
+    const readable = response.body;
+    window.mediaPullWorker.postMessage({ reader: readable, type: "start" }, [readable]);
+  }
+  window.getSessions = async () => {
+    let timestamp = Date.now();
+    const md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    await fetch(`./sessions`, {
+      method: "get",
+      headers: {
+        "Content-Type": "application/json",
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+      // body: JSON.stringify({
+      //   peer: btoa(JSON.stringify(d)),
+      // }),
+    })
+      .then((res) => res.json())
+      .then((body) => {
+        if (body.success) {
+          sessions = body.confs;
+          let output = [];
+          for (i of Object.keys(sessions)) {
+            output.push(`会议室:${i}, 参会人:${Object.keys(sessions[i].members).join(", ")}`);
+          }
+          document.getElementById("sessionsLog").innerHTML = output.join("\n");
+        }
+      })
+      .then(() => {
+        if (sid && sessions[sid]) {
+          for (ssrc in playingMedias) {
+            if (playingMedias[ssrc] && !Object.keys(sessions[sid]).includes(ssrc)) {
+              if (playingMedias[ssrc].videoTrack && playingMedias[ssrc].videoTrack.stop) {
+                playingMedias[ssrc].videoTrack.stop();
+              }
+              if (playingMedias[ssrc].audioTrack && playingMedias[ssrc].audioTrack.stop) {
+                playingMedias[ssrc].audioTrack.stop();
+              }
+              delete playingMedias[ssrc];
+            }
+            let id = `remote_${ssrc}`;
+            let video = document.getElementById(id);
+            if (video) {
+              video.parentElement.removeChild(video);
+            }
+          }
+        }
+      })
+      .catch(log);
+  }
+
+  window.createSession = async (is_host, audio_only) => {
+    let api_op = null;
+    if (is_host) {
+      api_op = "create";
+    } else {
+      await window.getSessions();
+      let target = Number.parseInt(targetInput.value);
+      if (!target || !sessions.hasOwnProperty(target)) {
+        let keys = Object.keys(sessions);
+        if (keys.length > 0) {
+          target = Number.parseInt(keys[0]);
+          targetInput.value = target;
+        } else {
+          return;
+        }
+      }
+      api_op = `join/${target}`;
+      sid = target;
+    }
+    let timestamp = Date.now();
+    let md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    let body = {
+      audio: {
+        samplerate: codedSampleRate,
+        channels: codedChannels,
+        codec: audioCodec
+      },
+    };
+    if (!audio_only) {
+      body.video = {
+        width: codedWidth,
+        height: codedHeight,
+        codec: videoCodec,
+      };
+    }
+    await fetch(`./http_conf/${api_op}`, {
+      method: "post",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+      body: JSON.stringify(body)
+    })
+      .then((res) => res.json())
+      .then((body) => {
+        if (body.success) {
+          if (is_host) {
+            sid = body.session.id;
+            mid = body.session.host;
+          } else {
+            mid = body.mid;
+          }
+          targetInput.value = sid;
+          attenderInput.value = mid;
+        }
+      })
+      .then(() => {
+        if (is_host) {
+          // return localClientStreamer(false);
+          return localHostStreamer();
+        } else {
+          return localClientStreamer(audio_only);
+        }
+      })
+      .then((readableStream) => {
+        // if (!is_host) {}
+        remoteStreamer();
+        return readableStream;
+      })
+      .then((readableStream) => {
+        timestamp = Date.now();
+        md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+        return fetch(`./http_conf/upstream/${sid}/${mid}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            "timestamp": timestamp,
+            "signature": md5Hash
+          }, body: readableStream,
+          duplex: "half",
+        });
+      })
+      .catch(log);
+  }
+
+  window.resumeSession = async () => {
+    let api_op = null;
+    await window.getSessions();
+    let target = Number.parseInt(targetInput.value);
+    if (!target || !sessions.hasOwnProperty(target)) {
+      let keys = Object.keys(sessions);
+      if (keys.length > 0) {
+        target = Number.parseInt(keys[0]);
+        targetInput.value = target;
+      } else {
+        return;
+      }
+    }
+    api_op = `join/${target}`;
+    if (!sid) {
+      let target = Number.parseInt(targetInput.value);
+      if (target.toString() !== "NaN") {
+        sid = target;
+      }
+    }
+    if (!mid) {
+      let attender = Number.parseInt(attenderInput.value);
+      if (attender.toString() !== "NaN") {
+        mid = attender;
+      }
+    }
+    localStreamer().then((readableStream) => {
+      sid = target;
+      timestamp = Date.now();
+      md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+      return fetch(`./http_conf/upstream/${sid}/${mid}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          "timestamp": timestamp,
+          "signature": md5Hash
+        }, body: readableStream,
+        duplex: "half",
+      });
+    })
+  }
+
+
+  window.stopSession = async () => {
+    // if (window.streamWorker) {
+    //   window.streamWorker.postMessage({ type: "stop" });
+    // }
+    let video = document.querySelector(`#localVideos>video`);
+    if (video) {
+      video.parentElement.removeChild(video);
+    }
+    if (localMedias.videoTrack && localMedias.videoTrack.stop) {
+      localMedias.videoTrack.stop();
+    }
+    let audio = document.querySelector(`#localVideos>audio`);
+    if (audio) {
+      audio.parentElement.removeChild(audio);
+    }
+    if (localMedias.audioTrack && localMedias.audioTrack.stop) {
+      localMedias.audioTrack.stop();
+    }
+    localMedias = {};
+    for (ssrc in playingMedias) {
+      if (playingMedias[ssrc]) {
+        if (playingMedias[ssrc].videoTrack && playingMedias[ssrc].videoTrack.stop) {
+          playingMedias[ssrc].videoTrack.stop();
+        }
+        if (playingMedias[ssrc].audioTrack && playingMedias[ssrc].audioTrack.stop) {
+          playingMedias[ssrc].audioTrack.stop();
+        }
+        delete playingMedias[ssrc];
+      }
+    }
+    let remoteMedias = document.querySelectorAll(`#remoteVideos>div`);
+    if (remoteMedias) {
+      remoteMedias.forEach((v) => {
+        v.parentElement.removeChild(v);
+      });
+    }
+    if (window.videoPushWorker) {
+      window.videoPushWorker.terminate();
+      window.videoPushWorker = null;
+    }
+    if (window.audioPushWorker) {
+      window.audioPushWorker.terminate();
+      window.audioPushWorker = null;
+    }
+    if (window.mediaPullWorker) {
+      window.mediaPullWorker.terminate();
+      window.mediaPullWorker = null;
+    }
+    if (!sid) {
+      let target = Number.parseInt(targetInput.value);
+      if (target.toString() !== "NaN") {
+        sid = target;
+      }
+    }
+    if (!mid) {
+      let attender = Number.parseInt(attenderInput.value);
+      if (attender.toString() !== "NaN") {
+        mid = attender;
+      }
+    }
+    if (sid && mid) {
+      let timestamp = Date.now();
+      let md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+      await fetch(`./http_conf/quit/${sid}/${mid}`, {
+        method: "delete",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          "timestamp": timestamp,
+          "signature": md5Hash
+        },
+      })
+        .then((res) => res.json())
+        .then((body) => {
+          if (body.success) {
+            sid = null;
+            mid = null;
+            targetInput.value = "";
+            attenderInput.value = "";
+          }
+        })
+        .catch(log);
+    }
+
+  }
+
+
+</script>
+
+</html>

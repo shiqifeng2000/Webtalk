@@ -1,0 +1,127 @@
+<html>
+
+<head></head>
+<style>
+  textarea {
+    width: 500px;
+    min-height: 75px;
+  }
+</style>
+
+<body>
+  <!-- Browser base64 Session Description<br />
+  <textarea id="localSessionDescription" readonly="true"></textarea> <br />
+
+  Golang base64 Session Description<br />
+  <textarea id="remoteSessionDescription"> </textarea> <br /> -->
+  <button onclick="window.startSession()">Start Session</button><br />
+
+  <!-- <br /> -->
+
+  Video<br />
+  <div id="remoteVideos"></div>
+  <br />
+
+  Logs<br />
+  <div id="div"></div>
+</body>
+<script>
+  window.startSession = () => {
+    var el = document.createElement("video");
+    el.autoplay = true;
+    el.controls = true;
+    let mediaStream = new MediaStream();
+    el.srcObject = mediaStream;
+    document.getElementById("remoteVideos").appendChild(el);
+
+    /* eslint-env browser */
+    let pc = new RTCPeerConnection({
+      iceServers: [
+        {
+          // urls: "stun:stun.l.google.com:19302",
+          urls: "stun:10.10.87.239:3478",
+        },
+      ],
+    });
+    let log = (msg) => {
+      document.getElementById("div").innerHTML += msg + "<br>";
+    };
+
+    pc.ontrack = function (event) {
+      // var el = document.createElement(event.track.kind);
+      // el.srcObject = event.streams[0];
+      // el.autoplay = true;
+      // el.controls = true;
+      mediaStream.addTrack(event.track);
+    };
+
+    pc.oniceconnectionstatechange = (e) => log(pc.iceConnectionState);
+    // let candidatePromise = new Promise((resolve, reject) => {
+    // });
+    pc.onicecandidate = (event) => {
+      if (event.candidate === null) {
+        // document.getElementById("localSessionDescription").value = btoa(
+        //   JSON.stringify(pc.localDescription)
+        // );
+        // console.log(pc.localDescription);
+
+      }
+      console.log(event);
+    };
+
+
+    // Offer to receive 1 audio, and 1 video track
+    pc.addTransceiver("video", { direction: "sendrecv" });
+    pc.addTransceiver("audio", { direction: "sendrecv" });
+
+    pc.createOffer()
+      .then((d) => {
+        console.log(d.sdp);
+        pc.setLocalDescription(d);
+        return d;
+      })
+      .then((d) => fetch(`/peer`, {
+        method: "post",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          peer: btoa(JSON.stringify(d)),
+        }),
+      }))
+      .then((res) => res.json())
+      .then((body) => {
+        if (body.success) {
+          try {
+            let sdp = JSON.parse(atob(body.data));
+            pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            console.log(sdp);
+          } catch (e) {
+            alert(e);
+          }
+        }
+      })
+      .catch(log);
+  }
+  // pc.createOffer()
+  //   .then((d) => pc.setLocalDescription(d))
+  //   .catch(log);
+
+  // window.startSession = () => {
+  //   let sd = document.getElementById("remoteSessionDescription").value;
+  //   if (sd === "") {
+  //     return alert("Session Description must not be empty");
+  //   }
+
+  //   try {
+  //     pc.setRemoteDescription(
+  //       new RTCSessionDescription(JSON.parse(atob(sd)))
+  //     );
+  //   } catch (e) {
+  //     alert(e);
+  //   }
+  // };
+</script>
+
+</html>

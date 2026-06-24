@@ -1,0 +1,1127 @@
+use crate::{
+    errors::VCError,
+    mq::{
+        ListenerDownEvent, ListenerUnstableEvent, ListenerUpEvent, MqActor, StreamDownEvent,
+        StreamUnstableEvent, StreamUpEvent,
+    },
+    tokio_read_lock, tokio_write_lock,
+    utils::{
+        self, api_from_list, peer_closed, weak_peer_closed, RtcJob, RtcSessions, RtcSocketPool,
+        MAX_SESSION_TIME, PEER_STUN_ADDRS,
+    },
+};
+use actix::Addr;
+use actix_web::{post, web, HttpRequest, HttpResponse, Result};
+use log::info;
+use serde_json::json;
+use std::{sync::Arc, time::Duration};
+use tokio::{
+    sync::{
+        broadcast::{self, error::RecvError},
+        Notify, RwLock,
+    },
+    time::Instant,
+};
+use webrtc::{
+    api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS},
+    data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel},
+    ice_transport::{
+        ice_candidate::RTCIceCandidate, ice_connection_state::RTCIceConnectionState,
+        ice_server::RTCIceServer,
+    },
+    peer_connection::{
+        configuration::RTCConfiguration, sdp::session_description::RTCSessionDescription,
+    },
+    rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication,
+    rtp_transceiver::{
+        rtp_codec::{RTCRtpCodecCapability, RTPCodecType},
+        rtp_receiver::RTCRtpReceiver,
+        rtp_transceiver_direction::RTCRtpTransceiverDirection,
+        RTCRtpTransceiver, RTCRtpTransceiverInit,
+    },
+    track::{
+        track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocal, TrackLocalWriter},
+        track_remote::TrackRemote,
+    },
+};
+
+/// 只发不收
+#[post("/publish")]
+pub async fn publish_stream(
+    peer_job: web::Json<RtcJob>,
+    sessions: web::Data<RwLock<RtcSessions>>,
+    sockets_pool: web::Data<RwLock<RtcSocketPool>>,
+    mq_addr: web::Data<Addr<MqActor>>,
+) -> Result<HttpResponse, VCError> {
+    let offer_str = &peer_job.peer;
+    let desc_data = utils::btoa(offer_str)?;
+    let offer = serde_json::from_str::<RTCSessionDescription>(&desc_data)?;
+    utils::check_sdp(&offer.sdp)?;
+    let stuns = PEER_STUN_ADDRS
+        .split(",")
+        .filter(|v| *v != "")
+        .map(|v| v.to_owned())
+        .collect::<Vec<String>>();
+    let ice_servers = if stuns.len() > 0 {
+        vec![RTCIceServer {
+            // urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            urls: stuns
+                .iter()
+                .map(|v| format!("stun:{}", v))
+                .collect::<Vec<String>>(),
+            ..Default::default()
+        }]
+    } else {
+        vec![]
+    };
+    let conf = RTCConfiguration {
+        ice_servers,
+        ..Default::default()
+    };
+    let sid = peer_job.token.unwrap_or(rand::random::<u32>());
+    let sockets = {
+        let required_sockets = peer_job.sockets.unwrap_or(1);
+        let mut s = tokio_write_lock!(sockets_pool, 10)?;
+        let result = s.malloc_sockets(required_sockets, &sid.to_string())?;
+        if result.len() == 0 {
+            return Err(vcerr!("Not enough sockets left"));
+        }
+        result
+        // vec![]
+    };
+    let api = api_from_list(&sockets);
+    // let api = gen_webrtc_api();
+    let connection = Arc::new(api.new_peer_connection(conf).await?);
+
+    connection
+        .add_transceiver_from_kind(
+            RTPCodecType::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Sendrecv,
+                send_encodings: vec![],
+            }),
+            // None,
+        )
+        .await?;
+    connection
+        .add_transceiver_from_kind(
+            RTPCodecType::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Sendrecv,
+                send_encodings: vec![],
+            }),
+        )
+        .await?;
+
+    let (vsdr, _) = broadcast::channel(1024 * 1024);
+    let (asdr, _) = broadcast::channel(1024 * 1024);
+    let (dsdr, _) = broadcast::channel(1024 * 1024);
+    {
+        let mut s = tokio_write_lock!(sessions, 10)?;
+        s.create_session(sid, sockets.clone(), &vsdr, &asdr, &dsdr, &connection)?;
+    }
+
+    let pc = Arc::downgrade(&connection);
+    let pc1 = pc.clone();
+    connection.on_track(Box::new(
+        move |track: Arc<TrackRemote>,
+              _receiver: Arc<RTCRtpReceiver>,
+              _tranceiver: Arc<RTCRtpTransceiver>| {
+            let media_ssrc = track.ssrc();
+            let pc2 = pc1.clone();
+            let kind = track.kind();
+            tokio::spawn(async move {
+                loop {
+                    if let Some(pc3) = pc2.upgrade() {
+                        if peer_closed(&pc3) {
+                            break;
+                        }
+                        if let Err(_e) = pc3
+                            .write_rtcp(&[Box::new(PictureLossIndication {
+                                sender_ssrc: 0,
+                                media_ssrc,
+                            })])
+                            .await
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                // if let Some(pc3) = pc2.upgrade() {
+                //     let closer = pc3.close().await;
+                //     info!("closing weak {sid} {:?}", closer);
+                // }
+                info!("[C->S] closing {sid}-{kind} pli thread");
+            });
+
+            let pc2 = pc1.clone();
+            match kind {
+                RTPCodecType::Video => {
+                    // let local_video_track1 = local_video_track1.clone();
+                    let vsdr1 = vsdr.clone();
+                    tokio::spawn(async move {
+                        let mut hb = Instant::now();
+                        loop {
+                            let timeout = tokio::time::sleep(Duration::from_secs(4));
+                            tokio::pin!(timeout);
+                            tokio::select! {
+                                _ = timeout.as_mut() => {
+                                    break;
+                                }
+                                m = track.read_rtp() => {
+                                    let now = Instant::now();
+                                    if now.duration_since(hb).as_secs() > 4 {
+                                        if weak_peer_closed(&pc2) {
+                                            break;
+                                        }
+                                    }
+                                    if let Ok((mut rtp, _n)) = m {
+                                        rtp.header.payload_type = 102;
+                                        let _ = vsdr1.send(rtp.clone());
+                                        hb = now;
+                                    } else if weak_peer_closed(&pc2) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        info!("closing {sid}-video read thread");
+                    });
+                }
+                RTPCodecType::Audio => {
+                    // let local_audio_track1 = local_audio_track1.clone();
+                    let asdr1 = asdr.clone();
+                    tokio::spawn(async move {
+                        let mut hb = Instant::now();
+                        loop {
+                            let timeout = tokio::time::sleep(Duration::from_secs(4));
+                            tokio::pin!(timeout);
+                            tokio::select! {
+                                _ = timeout.as_mut() => {
+                                    break;
+                                }
+                                m = track.read_rtp() => {
+                                    let now = Instant::now();
+                                    if now.duration_since(hb).as_secs() > 4 {
+                                        if weak_peer_closed(&pc2) {
+                                            break;
+                                        }
+                                    }
+                                    if let Ok((mut rtp, _n)) = m {
+                                        rtp.header.payload_type = 111;
+                                        let _ = asdr1.send(rtp.clone());
+                                        hb = now;
+                                    } else if weak_peer_closed(&pc2) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        info!("closing {sid}-audio read thread");
+                    });
+                }
+                _ => {}
+            }
+            Box::pin(async {})
+        },
+    ));
+
+    let pc1 = pc.clone();
+    let dsdr1 = dsdr.clone();
+    connection.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let dc1 = dc.clone();
+        let pc2 = pc1.clone();
+        let mut drcv2 = dsdr1.subscribe();
+        info!("Session {sid} data_channel open");
+        dc.on_open(Box::new(move || {
+            Box::pin(async move {
+                loop {
+                    let timeout = tokio::time::sleep(Duration::from_secs(4));
+                    tokio::pin!(timeout);
+                    tokio::select! {
+                        _ = timeout.as_mut() => {
+                            if weak_peer_closed(&pc2) {
+                                break;
+                            }
+                        }
+                        m = drcv2.recv() => {
+                            if let Ok(d) = m {
+                                let _ = dc1.send(&d).await;
+                            } else if weak_peer_closed(&pc2) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                info!("[C->S] closing {sid} data_channel");
+            })
+        }));
+        Box::pin(async move {})
+    }));
+
+    // let clist = Arc::new(RwLock::new(vec![]));
+    // let clist1 = clist.clone();
+    connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        info!("Session {sid} candidate {:#?} ", candidate);
+        // let clist1 = clist1.clone();
+        Box::pin(async move {
+            // if let Ok(mut l) = tokio_write_lock!(clist1, 10) {
+            //     let item = match candidate {
+            //         Some(v) => v.to_json().ok(),
+            //         None => None,
+            //     };
+            //     l.push(item);
+            // }
+        })
+    }));
+
+    // let connection1 = connection.clone();
+    let notify = Arc::new(Notify::new());
+    let notify1 = notify.clone();
+    connection.on_ice_connection_state_change(Box::new(
+        move |connection_state: RTCIceConnectionState| {
+            info!("Session state changed {connection_state}",);
+            if connection_state == RTCIceConnectionState::Connected {
+                mq_addr.do_send(StreamUpEvent::new(sid));
+            } else if connection_state == RTCIceConnectionState::Disconnected {
+                mq_addr.do_send(StreamUnstableEvent::new(sid));
+            }
+            if connection_state == RTCIceConnectionState::Closed
+                || connection_state == RTCIceConnectionState::Failed
+            {
+                mq_addr.do_send(StreamDownEvent::new(sid));
+                notify1.notify_waiters();
+            }
+            Box::pin(async {})
+        },
+    ));
+
+    // close 需要放在事件外面
+    let connection1 = connection.clone();
+    let sockets1 = sockets.clone();
+    tokio::spawn(async move {
+        let timeout = tokio::time::sleep(Duration::from_secs(*MAX_SESSION_TIME));
+        tokio::pin!(timeout);
+        tokio::select! {
+            _ = timeout.as_mut() => {}
+            _ = notify.notified() => {}
+        }
+        let closer = connection1.close().await;
+        info!("[C->S] closing {sid} peer {:?}", closer);
+
+        if let Ok(mut pool) = tokio_write_lock!(sockets_pool, 10) {
+            pool.release_sockets(sockets1.clone());
+            info!("[C->S] releasing {sid} sockets {:?} to pool", sockets1);
+        }
+    });
+
+    connection.set_remote_description(offer).await?;
+    let answer = connection.create_answer(None).await?;
+
+    // if let Some(remote_candidates) = &peer_job.candidates {
+    //     for c in remote_candidates {
+    //         if let Some(c1) = c {
+    //             if *DEBUG_MODE {
+    //                 info!("adding {sid} candidate {:?}", c1);
+    //             }
+    //             let _ = connection.add_ice_candidate(c1.clone()).await;
+    //         }
+    //     }
+    // }
+
+    let mut gather_complete = connection.gathering_complete_promise().await;
+    connection.set_local_description(answer).await?;
+    let _ = gather_complete.recv().await;
+    let result = connection
+        .local_description()
+        .await
+        .map(|v| serde_json::to_string(&v).map_err(|e| e.into()))
+        .unwrap_or(Err(VCError::new("Error getting server sdp description")))?;
+    let data = utils::atob(&result);
+
+    // let candidates = tokio_read_lock!(clist, 10)?.clone();
+    Ok(HttpResponse::Ok().json(json!({"success": true, "sid":sid, "data": data})))
+}
+
+/// 只收不发
+#[post("/subscribe")]
+pub async fn subscribe_stream(
+    peer_job: web::Json<RtcJob>,
+    sessions: web::Data<RwLock<RtcSessions>>,
+    sockets_pool: web::Data<RwLock<RtcSocketPool>>,
+    mq_addr: web::Data<Addr<MqActor>>,
+    req: HttpRequest,
+) -> Result<HttpResponse, VCError> {
+    let offer_str = &peer_job.peer;
+    let target = peer_job
+        .target
+        .ok_or(vcerr!("target id must be provided"))?;
+    let target_session = {
+        let s = tokio_read_lock!(sessions, 10)?;
+        s.get_session(target)
+            .ok_or(vcerr!("no such target {target}"))?
+    };
+    let addr0 = req
+        .peer_addr()
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or("".to_owned());
+    let addr = Arc::new(addr0.clone());
+    let desc_data = utils::btoa(offer_str)?;
+    let offer = serde_json::from_str::<RTCSessionDescription>(&desc_data)?;
+    utils::check_sdp(&offer.sdp)?;
+    let stuns = PEER_STUN_ADDRS
+        .split(",")
+        .filter(|v| *v != "")
+        .map(|v| v.to_owned())
+        .collect::<Vec<String>>();
+    let ice_servers = if stuns.len() > 0 {
+        vec![RTCIceServer {
+            // urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            urls: stuns
+                .iter()
+                .map(|v| format!("stun:{}", v))
+                .collect::<Vec<String>>(),
+            ..Default::default()
+        }]
+    } else {
+        vec![]
+    };
+    let conf = RTCConfiguration {
+        ice_servers,
+        ..Default::default()
+    };
+    let sockets = {
+        let required_sockets = peer_job.sockets.unwrap_or(1);
+        let mut s = tokio_write_lock!(sockets_pool, 10)?;
+        let result = s.malloc_sockets(required_sockets, &addr0)?;
+        if result.len() == 0 {
+            return Err(vcerr!("Not enough sockets left"));
+        }
+        result
+    };
+    let api = api_from_list(&sockets);
+
+    let connection = Arc::new(api.new_peer_connection(conf).await?);
+
+    // Create Track that we send video back to browser on
+    let local_video_track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            ..Default::default()
+        },
+        "video".to_owned(),
+        "webrtc-rs".to_owned(),
+    ));
+    let local_audio_track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            ..Default::default()
+        },
+        "audio".to_owned(),
+        "webrtc-rs".to_owned(),
+    ));
+
+    let local_video_track1 = local_video_track.clone();
+    let connection1 = connection.clone();
+    let mut vrcv = target_session.vsdr.subscribe();
+    let addr1 = addr.clone();
+    tokio::spawn(async move {
+        let mut check_time = Instant::now();
+        loop {
+            let t = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(t);
+            tokio::select! {
+                _ = t.as_mut() => {
+                    if peer_closed(&connection1) {
+                        break;
+                    }
+                }
+                m = vrcv.recv() => {
+                    let now = Instant::now();
+                    if now.duration_since(check_time).as_secs() > 4 {
+                        if peer_closed(&connection1) {
+                            break;
+                        }
+                        check_time = now;
+                    }
+                    if let Ok(rtp) = m {
+                        let result = local_video_track1.write_rtp(&rtp).await;
+                        if let Err(_err) = &result {
+                            if peer_closed(&connection1) {
+                                break;
+                            }
+                        }
+                    } else if let Err(RecvError::Closed) = m {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("[S->C] closing addr {addr1} video listen thread");
+    });
+
+    let local_audio_track1 = local_audio_track.clone();
+    let connection1 = connection.clone();
+    let mut arcv = target_session.asdr.subscribe();
+    let addr1 = addr.clone();
+    tokio::spawn(async move {
+        let mut check_time = Instant::now();
+        loop {
+            let t = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(t);
+            tokio::select! {
+                _ = t.as_mut() => {
+                    if peer_closed(&connection1) {
+                        break;
+                    }
+                }
+                m = arcv.recv() => {
+                    let now = Instant::now();
+                    if now.duration_since(check_time).as_secs() > 4 {
+                        if peer_closed(&connection1) {
+                            break;
+                        }
+                        check_time = now;
+                    }
+                    if let Ok(rtp) = m {
+                        let result = local_audio_track1.write_rtp(&rtp).await;
+                        if let Err(_err) = &result {
+                            if peer_closed(&connection1) {
+                                break;
+                            }
+                        }
+                    } else if let Err(RecvError::Closed) = m {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("[S->C] closing addr {addr1} audio listen thread");
+    });
+
+    let addr1 = addr.clone();
+    let connection1 = connection.clone();
+    let rtp_sender = connection
+        .add_track(Arc::clone(&local_video_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await?;
+    tokio::spawn(async move {
+        let mut rtcp_buf = vec![0u8; 1500];
+        let mut hb = Instant::now();
+        loop {
+            let timeout = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = timeout.as_mut() => {
+                    if peer_closed(&connection1){
+                        break;
+                    }
+                    if Instant::now().duration_since(hb).as_secs() > 10 {
+                        break;
+                    }
+                }
+                p = rtp_sender.read(&mut rtcp_buf)=> {
+                    if p.is_ok() {
+                        hb = Instant::now();
+                    } else {
+                        if peer_closed(&connection1){
+                            break;
+                        }
+                        if Instant::now().duration_since(hb).as_secs() > 4 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        info!("[S->C] closing addr {addr1} video rtcp");
+    });
+
+    let addr1 = addr.clone();
+    let connection1 = connection.clone();
+    let rtp_sender = connection
+        .add_track(Arc::clone(&local_audio_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await?;
+    tokio::spawn(async move {
+        let mut rtcp_buf = vec![0u8; 1500];
+        let mut hb = Instant::now();
+        loop {
+            let timeout = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = timeout.as_mut() => {
+                    if peer_closed(&connection1){
+                        break;
+                    }
+                    if Instant::now().duration_since(hb).as_secs() > 10 {
+                        break;
+                    }
+                }
+                p = rtp_sender.read(&mut rtcp_buf)=> {
+                    if p.is_ok() {
+                        hb = Instant::now();
+                    } else {
+                        if peer_closed(&connection1){
+                            break;
+                        }
+                        if Instant::now().duration_since(hb).as_secs() > 4 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        info!("[S->C] closing addr {addr1} audio rtcp");
+    });
+
+    let dsdr = target_session.dsdr.clone();
+    connection.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let dsdr1 = dsdr.clone();
+        Box::pin(async move {
+            let dsdr2 = dsdr1.clone();
+            dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                let _ = dsdr2.send(msg.data);
+                Box::pin(async {})
+            }));
+        })
+    }));
+
+    let addr1 = Arc::downgrade(&addr);
+    // let clist = Arc::new(RwLock::new(vec![]));
+    // let clist1 = clist.clone();
+    connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        let addr2 = addr1
+            .upgrade()
+            .map(|v| format!("{v}"))
+            .unwrap_or("".to_owned());
+        info!("Session {addr2} candidate {:#?} ", candidate);
+        // let clist1 = clist1.clone();
+        Box::pin(async move {
+            // if let Ok(mut l) = tokio_write_lock!(clist1, 10) {
+            //     l.push(candidate);
+            // }
+        })
+    }));
+
+    let addr1 = Arc::downgrade(&addr);
+    let sessions1 = sessions.clone();
+    let notify = Arc::new(Notify::new());
+    let notify1 = notify.clone();
+    let addr2 = addr0.clone();
+    connection.on_ice_connection_state_change(Box::new(
+        move |connection_state: RTCIceConnectionState| {
+            info!("Session {addr2} state changed {connection_state}",);
+            if connection_state == RTCIceConnectionState::Connected {
+                let sessions1 = sessions1.clone();
+                let addr2 = addr2.clone();
+                let addr1 = addr1.clone();
+                let mq_addr1 = mq_addr.clone();
+                Box::pin(async move {
+                    if let Ok(mut s) = tokio_write_lock!(sessions1, 10) {
+                        mq_addr1.do_send(ListenerUpEvent::new(target, &addr2));
+                        s.set_listener(target, &addr1);
+                    }
+                })
+            } else if connection_state == RTCIceConnectionState::Disconnected {
+                mq_addr.do_send(ListenerUnstableEvent::new(target, &addr2));
+                Box::pin(async {})
+            } else if connection_state == RTCIceConnectionState::Closed
+                || connection_state == RTCIceConnectionState::Failed
+            {
+                notify1.notify_waiters();
+                let addr2 = addr2.clone();
+                let sessions1 = sessions1.clone();
+                let mq_addr1 = mq_addr.clone();
+                Box::pin(async move {
+                    if let Ok(mut s) = tokio_write_lock!(sessions1, 10) {
+                        mq_addr1.do_send(ListenerDownEvent::new(target, &addr2));
+                        s.drop_listener(target, &addr2);
+                    }
+                })
+            } else {
+                Box::pin(async {})
+            }
+        },
+    ));
+
+    let addr2 = addr0.clone();
+    let connection1 = connection.clone();
+    tokio::spawn(async move {
+        let timeout = tokio::time::sleep(Duration::from_secs(*MAX_SESSION_TIME));
+        tokio::pin!(timeout);
+        tokio::select! {
+            _ = timeout.as_mut() => {}
+            _ = notify.notified() => {}
+        }
+        let closer = connection1.close().await;
+        info!("[S->C] closing {addr2} peer {:?}", closer);
+
+        if let Ok(mut pool) = tokio_write_lock!(sockets_pool, 10) {
+            pool.release_sockets(sockets.clone());
+            info!("releasing {addr2} sockets {:?} to pool", sockets);
+        }
+    });
+
+    connection.set_remote_description(offer).await?;
+    let answer = connection.create_answer(None).await?;
+
+    // if let Some(remote_candidates) = &peer_job.candidates {
+    //     for c in remote_candidates {
+    //         if let Some(c1) = c {
+    //             if *DEBUG_MODE {
+    //                 info!("adding {addr} candidate {:?}", c1);
+    //             }
+    //             let _ = connection.add_ice_candidate(c1.clone()).await;
+    //         }
+    //     }
+    // }
+
+    let mut gather_complete = connection.gathering_complete_promise().await;
+    connection.set_local_description(answer).await?;
+    let _ = gather_complete.recv().await;
+    let result = connection
+        .local_description()
+        .await
+        .map(|v| serde_json::to_string(&v).map_err(|e| e.into()))
+        .unwrap_or(Err(VCError::new("Error getting server sdp description")))?;
+    let data = utils::atob(&result);
+
+    // let candidates = tokio_read_lock!(clist, 10)?.clone();
+
+    Ok(HttpResponse::Ok().json(json!({"success": true, "data": data})))
+}
+
+#[post("/publish_subscribe")]
+pub async fn publish_subscribe_stream(
+    peer_job: web::Json<RtcJob>,
+    sessions: web::Data<RwLock<RtcSessions>>,
+    sockets_pool: web::Data<RwLock<RtcSocketPool>>,
+    mq_addr: web::Data<Addr<MqActor>>,
+) -> Result<HttpResponse, VCError> {
+    let offer_str = &peer_job.peer;
+    let target = peer_job
+        .target
+        .ok_or(vcerr!("target id must be provided"))?;
+    let target_session = {
+        let s = tokio_read_lock!(sessions, 10)?;
+        s.get_session(target)
+            .ok_or(vcerr!("no such target {target}"))?
+    };
+    let desc_data = utils::btoa(offer_str)?;
+    let offer = serde_json::from_str::<RTCSessionDescription>(&desc_data)?;
+    utils::check_sdp(&offer.sdp)?;
+    let stuns = PEER_STUN_ADDRS
+        .split(",")
+        .filter(|v| *v != "")
+        .map(|v| v.to_owned())
+        .collect::<Vec<String>>();
+    let ice_servers = if stuns.len() > 0 {
+        vec![RTCIceServer {
+            // urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            urls: stuns
+                .iter()
+                .map(|v| format!("stun:{}", v))
+                .collect::<Vec<String>>(),
+            ..Default::default()
+        }]
+    } else {
+        vec![]
+    };
+    let conf = RTCConfiguration {
+        ice_servers,
+        ..Default::default()
+    };
+    let sid = peer_job.token.unwrap_or(rand::random::<u32>());
+    let sockets = {
+        let required_sockets = peer_job.sockets.unwrap_or(1);
+        let mut s = tokio_write_lock!(sockets_pool, 10)?;
+        let result = s.malloc_sockets(required_sockets, &sid.to_string())?;
+        if result.len() == 0 {
+            return Err(vcerr!("Not enough sockets left"));
+        }
+        result
+    };
+    let api = api_from_list(&sockets);
+    let connection = Arc::new(api.new_peer_connection(conf).await?);
+
+    connection
+        .add_transceiver_from_kind(
+            RTPCodecType::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Sendrecv,
+                send_encodings: vec![],
+            }),
+        )
+        .await?;
+    connection
+        .add_transceiver_from_kind(
+            RTPCodecType::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Sendrecv,
+                send_encodings: vec![],
+            }),
+        )
+        .await?;
+
+    let (vsdr, _) = broadcast::channel(1024 * 1024);
+    let (asdr, _) = broadcast::channel(1024 * 1024);
+    let (dsdr, _) = broadcast::channel(1024 * 1024);
+    {
+        let mut s = tokio_write_lock!(sessions, 10)?;
+        s.create_session(sid, sockets.clone(), &vsdr, &asdr, &dsdr, &connection)?;
+    }
+    let sid_arc = Arc::new(target.to_string());
+    // Create Track that we send video back to browser on
+    let local_video_track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            ..Default::default()
+        },
+        "video".to_owned(),
+        "webrtc-rs".to_owned(),
+    ));
+    let local_audio_track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            ..Default::default()
+        },
+        "audio".to_owned(),
+        "webrtc-rs".to_owned(),
+    ));
+
+    let local_video_track1 = local_video_track.clone();
+    let sid_arc1 = sid_arc.clone();
+    let connection1 = connection.clone();
+    let mut vrcv = target_session.vsdr.subscribe();
+    tokio::spawn(async move {
+        let mut check_time = Instant::now();
+        loop {
+            let t = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(t);
+            tokio::select! {
+                _ = t.as_mut() => {
+                    if peer_closed(&connection1) {
+                        break;
+                    }
+                }
+                m = vrcv.recv() => {
+                    let now = Instant::now();
+                    if now.duration_since(check_time).as_secs() > 4 {
+                        if peer_closed(&connection1) {
+                            break;
+                        }
+                        check_time = now;
+                    }
+                    let rtp = m.unwrap();
+                    let result = local_video_track1.write_rtp(&rtp).await;
+                    if let Err(_err) = &result {
+                        if peer_closed(&connection1) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        info!("closing {target}->{sid_arc1} video listener");
+    });
+
+    let local_audio_track1 = local_audio_track.clone();
+    let sid_arc1 = sid_arc.clone();
+    let connection1 = connection.clone();
+    let mut arcv = target_session.asdr.subscribe();
+    tokio::spawn(async move {
+        let mut check_time = Instant::now();
+        loop {
+            let t = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(t);
+            tokio::select! {
+                _ = t.as_mut() => {
+                    if peer_closed(&connection1) {
+                        break;
+                    }
+                }
+                m = arcv.recv() => {
+                    let now = Instant::now();
+                    if now.duration_since(check_time).as_secs() > 4 {
+                        if peer_closed(&connection1) {
+                            break;
+                        }
+                        check_time = now;
+                    }
+                    let rtp = m.unwrap();
+                    let result = local_audio_track1.write_rtp(&rtp).await;
+                    if let Err(_err) = &result {
+                        if peer_closed(&connection1) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        info!("closing {target}->{sid_arc1} audio listener");
+    });
+    let connection1 = connection.clone();
+    let rtp_sender = connection
+        .add_track(Arc::clone(&local_video_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await?;
+    tokio::spawn(async move {
+        let mut rtcp_buf = vec![0u8; 1500];
+        let mut hb = Instant::now();
+        loop {
+            let timeout = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = timeout.as_mut() => {
+                    if peer_closed(&connection1){
+                        break;
+                    }
+                    if Instant::now().duration_since(hb).as_secs() > 10 {
+                        break;
+                    }
+                }
+                Ok((_, _)) = rtp_sender.read(&mut rtcp_buf)=> {
+                    hb = Instant::now();
+                }
+            }
+        }
+        if !peer_closed(&connection1) {
+            let _ = connection1.close().await;
+        }
+        info!("closing {sid} video rtcp");
+
+        if let Ok(mut pool) = tokio_write_lock!(sockets_pool, 10) {
+            pool.release_sockets(sockets.clone());
+            info!("releasing {sid} sockets {:?} to pool", sockets);
+        }
+    });
+
+    let connection1 = connection.clone();
+    let rtp_sender = connection
+        .add_track(Arc::clone(&local_audio_track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await?;
+    tokio::spawn(async move {
+        let mut rtcp_buf = vec![0u8; 1500];
+        let mut hb = Instant::now();
+        loop {
+            let timeout = tokio::time::sleep(Duration::from_secs(4));
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = timeout.as_mut() => {
+                    if peer_closed(&connection1){
+                        break;
+                    }
+                    if Instant::now().duration_since(hb).as_secs() > 10 {
+                        break;
+                    }
+                }
+                Ok((_, _)) = rtp_sender.read(&mut rtcp_buf)=> {
+                    hb = Instant::now();
+                }
+            }
+        }
+        info!("closing {sid} audio rtcp");
+    });
+
+    let pc = Arc::downgrade(&connection);
+    let pc1 = pc.clone();
+    connection.on_track(Box::new(
+        move |track: Arc<TrackRemote>,
+              _receiver: Arc<RTCRtpReceiver>,
+              _tranceiver: Arc<RTCRtpTransceiver>| {
+            let media_ssrc = track.ssrc();
+            let pc2 = pc1.clone();
+            let kind = track.kind();
+            tokio::spawn(async move {
+                loop {
+                    if let Some(pc3) = pc2.upgrade() {
+                        if peer_closed(&pc3) {
+                            break;
+                        }
+                        if let Err(_e) = pc3
+                            .write_rtcp(&[Box::new(PictureLossIndication {
+                                sender_ssrc: 0,
+                                media_ssrc,
+                            })])
+                            .await
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                info!("closing {kind} pli thread");
+            });
+
+            let pc2 = pc1.clone();
+            match kind {
+                RTPCodecType::Video => {
+                    // let local_video_track1 = local_video_track1.clone();
+                    let vsdr1 = vsdr.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let timeout = tokio::time::sleep(Duration::from_secs(4));
+                            tokio::pin!(timeout);
+                            tokio::select! {
+                                _ = timeout.as_mut() => {
+                                    break;
+                                }
+                                m = track.read_rtp() => {
+                                    if let Some(pc3) = pc2.upgrade() {
+                                        if peer_closed(&pc3) {
+                                            break;
+                                        }
+                                    }
+                                    if let Ok((mut rtp, _n)) = m {
+                                        rtp.header.payload_type = 102;
+                                        let _ = vsdr1.send(rtp.clone());
+                                    }
+                                }
+                            }
+                        }
+                        info!("closing {sid} video read thread");
+                    });
+                }
+                RTPCodecType::Audio => {
+                    // let local_audio_track1 = local_audio_track1.clone();
+                    let asdr1 = asdr.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let timeout = tokio::time::sleep(Duration::from_secs(4));
+                            tokio::pin!(timeout);
+                            tokio::select! {
+                                _ = timeout.as_mut() => {
+                                    break;
+                                }
+                                m = track.read_rtp() => {
+                                    if let Some(pc3) = pc2.upgrade() {
+                                        if peer_closed(&pc3) {
+                                            break;
+                                        }
+                                    }
+                                    if let Ok((mut rtp, _n)) = m {
+                                        rtp.header.payload_type = 111;
+                                        let _ = asdr1.send(rtp.clone());
+                                    }
+                                }
+                            }
+                        }
+                        info!("closing {sid} audio read thread");
+                    });
+                }
+                _ => {}
+            }
+            Box::pin(async {})
+        },
+    ));
+
+    // let clist = Arc::new(RwLock::new(vec![]));
+    // let clist1 = clist.clone();
+    connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        info!("Session {sid} candidate {:#?} ", candidate);
+        // let clist1 = clist1.clone();
+        Box::pin(async move {
+            // if let Ok(mut l) = tokio_write_lock!(clist1, 10) {
+            //     l.push(candidate);
+            // }
+        })
+    }));
+
+    let tdsdr1 = target_session.dsdr.clone();
+    let pc1 = pc.clone();
+    let dsdr1 = dsdr.clone();
+    connection.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let dc1 = dc.clone();
+        let pc2 = pc1.clone();
+        let mut drcv2 = dsdr1.subscribe();
+        info!("Session {sid} data_channel open");
+
+        dc.on_open(Box::new(move || {
+            Box::pin(async move {
+                loop {
+                    let timeout = tokio::time::sleep(Duration::from_secs(4));
+                    tokio::pin!(timeout);
+                    tokio::select! {
+                            _ = timeout.as_mut() => {
+                                if weak_peer_closed(&pc2) {
+                                    break;
+                                }
+                            }
+                            m = drcv2.recv() => {
+                                if let Ok(d) = m {
+                                    let a = dc1.send(&d).await;
+                                    info!("subscribe msg d{:?} {:?}", d, a);
+                                } else if weak_peer_closed(&pc2) {
+                                    break;
+                                }
+                            }
+                    }
+                }
+                info!("Session {sid} data_channel close");
+            })
+        }));
+        let tdsdr2 = tdsdr1.clone();
+        Box::pin(async move {
+            dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                let _ = tdsdr2.send(msg.data);
+                Box::pin(async {})
+            }));
+        })
+    }));
+
+    let sessions1 = sessions.clone();
+    let sid_arc1 = Arc::downgrade(&sid_arc);
+    connection.on_ice_connection_state_change(Box::new(
+        move |connection_state: RTCIceConnectionState| {
+            info!("Session {sid} state changed {connection_state}",);
+            if connection_state == RTCIceConnectionState::Connected {
+                let sessions1 = sessions1.clone();
+                let sid_arc1 = sid_arc1.clone();
+                let mq_addr1 = mq_addr.clone();
+                Box::pin(async move {
+                    if let Ok(mut s) = tokio_write_lock!(sessions1, 10) {
+                        s.set_listener(target, &sid_arc1);
+                        mq_addr1.do_send(StreamUpEvent::new(sid));
+                        mq_addr1.do_send(ListenerUpEvent::new(target, &sid.to_string()));
+                    }
+                })
+            } else if connection_state == RTCIceConnectionState::Disconnected {
+                mq_addr.do_send(StreamUnstableEvent::new(sid));
+                mq_addr.do_send(ListenerUnstableEvent::new(target, &sid.to_string()));
+                Box::pin(async {})
+            } else if connection_state == RTCIceConnectionState::Closed
+                || connection_state == RTCIceConnectionState::Failed
+            {
+                let sessions1 = sessions1.clone();
+                let mq_addr1 = mq_addr.clone();
+                Box::pin(async move {
+                    if let Ok(mut s) = tokio_write_lock!(sessions1, 10) {
+                        mq_addr1.do_send(StreamDownEvent::new(sid));
+                        mq_addr1.do_send(ListenerDownEvent::new(target, &sid.to_string()));
+                        s.drop_listener(target, &sid.to_string());
+                    }
+                })
+            } else {
+                Box::pin(async {})
+            }
+        },
+    ));
+    connection.set_remote_description(offer).await?;
+    let answer = connection.create_answer(None).await?;
+    let mut gather_complete = connection.gathering_complete_promise().await;
+    connection.set_local_description(answer).await?;
+    let _ = gather_complete.recv().await;
+    let result = connection
+        .local_description()
+        .await
+        .map(|v| serde_json::to_string(&v).map_err(|e| e.into()))
+        .unwrap_or(Err(VCError::new("Error getting server sdp description")))?;
+    let data = utils::atob(&result);
+    // let candidates = tokio_read_lock!(clist, 10)?.clone();
+
+    Ok(HttpResponse::Ok().json(json!({"success": true, "sid":sid, "data": data})))
+}

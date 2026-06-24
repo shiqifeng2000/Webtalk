@@ -1,0 +1,39 @@
+version: "2"
+
+services:
+  web:
+    restart: always
+    image: webtalk:v0.8
+    container_name: webtalk
+    # network_mode: host
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "31401:31401/udp"
+      - "10102-10200:10102-10200/udp"
+    volumes:
+      # 以下是非共享类
+      # - ./webtalk:/app/webtalk
+      - ./.env:/app/.env
+      # 以下是共享类
+      - ./log:/app/log
+      - ./cert:/app/cert
+      - ./static:/app/static
+    environment:
+      - TZ=Asia/Shanghai
+      # - EPHEMERAL_UDP_MIN_PORT=30403
+      # - EPHEMERAL_UDP_MAX_PORT=30499
+      # - EPHEMERAL_PORTS=30403,30404,30405,30406,30407,30408,30409,30410,30411,30412,30413
+      # - TURN_ADDR=0.0.0.0:30402
+      # - PEER_STUN_ADDRS=10.10.87.239:31401
+      # - STUN_ADDR=0.0.0.0:31401
+      # - HOST_CANDIDATE_IP=10.10.87.239
+      # - SERVER_PORT=10000
+      # - SSL_SERVER_PORT=10001
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: "all"
+    #           capabilities: [ gpu ]

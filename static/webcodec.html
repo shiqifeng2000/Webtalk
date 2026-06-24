@@ -1,0 +1,164 @@
+<html>
+
+<head></head>
+<style>
+  textarea {
+    width: 500px;
+    min-height: 75px;
+  }
+
+  section {
+    font-size: 0;
+  }
+
+  section video {
+    /* width: 100%; */
+    width: 50%;
+    height: 40%;
+    object-fit: scale-down;
+  }
+
+  body {
+    padding: 0;
+    margin: 0;
+  }
+</style>
+
+<body>
+  <!-- Browser base64 Session Description<br />
+    <textarea id="localSessionDescription" readonly="true"></textarea> <br />
+
+    Golang base64 Session Description<br />
+    <textarea id="remoteSessionDescription"> </textarea> <br />
+    <button onclick="window.startSession()">Start Session</button><br />
+
+    <br /> -->
+
+  Video<br />
+  <!-- <video id="remoteVideos" autoplay muted controls style="width: 100%; height: 50%px"></video> -->
+  <section id="section">
+    <!-- <video id="remoteVideos" autoplay muted controls></video> -->
+  </section>
+  <br />
+  <!-- <video id="test" controls muted></video> -->
+  Message<br />
+  <!-- <form onsubmit="return sendMessage()"> -->
+  <form>
+    <input id="target" />
+    <button type="button" onclick="return getSessions()" id="queryBtn">查询频道</button>
+    <button type="button" onclick="return createTask()">添加视频</button>
+    <button type="button" onclick="return stopTask()">终止视频</button>
+  </form>
+  已发布会话<br />
+  <div id="sessions"></div>
+
+  Logs<br />
+  <div id="status"></div>
+  <div id="debug"></div>
+</body>
+<script src="/md5.min.js?TOKEN=webtalk"></script>
+<script>
+  let start_time = Date.now();
+  const TOKEN = "webtalk";
+  const targetInput = document.getElementById("target");
+  const section = document.getElementById("section");
+
+  let log = (msg) => {
+    document.getElementById("debug").innerHTML += msg + "<br>";
+  };
+
+  window.getSessions = async () => {
+    let timestamp = Date.now();
+    const md5Hash = md5(`${timestamp}&${TOKEN}`).toString();
+    fetch(`/sessions`, {
+      method: "get",
+      headers: {
+        "Content-Type": "application/json",
+        "timestamp": timestamp,
+        "signature": md5Hash
+      },
+      // body: JSON.stringify({
+      //   peer: btoa(JSON.stringify(d)),
+      // }),
+    })
+      .then((res) => res.json())
+      .then((body) => {
+        if (body.success) {
+          if (sessions.length == body.sessions.length) {
+            let ls_diff = false;
+            let rs_diff = false;
+            for (let ls of Object.keys(sessions)) {
+              if (!body.sessions.hasOwnProperty(ls)) {
+                ls_diff = true;
+                break;
+              }
+            }
+            if (!ls_diff) {
+              for (let rs of Object.keys(body.sessions)) {
+                if (!sessions.hasOwnProperty(rs)) {
+                  rs_diff = true;
+                  break;
+                }
+              }
+            }
+            if (ls_diff || rs_diff) {
+              sessions = body.sessions;
+              document.getElementById("sessions").innerHTML = Object.keys(sessions).join(", ");
+            }
+          } else {
+            sessions = body.sessions;
+            document.getElementById("sessions").innerHTML = Object.keys(sessions).join(", ");
+          }
+        }
+      })
+      .catch(log);
+  }
+
+  window.createTask = async () => {
+    let target = Number.parseInt(targetInput.value);
+    if (!target || !sessions.hasOwnProperty(target)) {
+      let keys = Object.keys(sessions);
+      if (keys.length > 0) {
+        target = Number.parseInt(keys[0]);
+        targetInput.value = target;
+      } else {
+        return;
+      }
+    }
+
+    if (window.streamWorker) {
+      window.streamWorker.terminate();
+    }
+
+    let video = document.createElement("video");
+    video.id = `video_${target}`;
+    video.autoplay = true;
+    video.controls = true;
+    section.appendChild(video);
+    let audioTrackGenerator = new MediaStreamTrackGenerator({ kind: "audio" });
+    let videoTrackGenerator = new MediaStreamTrackGenerator({ kind: "video" });
+    video.srcObject = new MediaStream([videoTrackGenerator, audioTrackGenerator]);
+    video.onplay = () => {
+      log(`timecost ${Date.now() - start_time}`)
+    }
+    let audioWritable = audioTrackGenerator.writable;
+    let videoWritable = videoTrackGenerator.writable;
+    window.streamWorker = new Worker("./pull.worker.es.js?TOKEN=webtalk");
+    window.streamWorker.postMessage({ url: `${window.location.origin}/es_streamer/${target}?TOKEN=webtalk`, audioWritable, videoWritable, type: "start" }, [audioWritable, videoWritable]);
+  }
+
+  window.stopTask = () => {
+    // if (window.streamWorker) {
+    //   window.streamWorker.postMessage({ type: "stop" });
+    // }
+    let video = document.getElementById(`video_${targetInput.value}`);
+    if (video) {
+      video.parentElement.removeChild(video);
+    }
+    window.streamWorker.terminate();
+    window.streamWorker = null;
+  }
+
+</script>
+
+</html>

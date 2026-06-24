@@ -1,0 +1,6 @@
+/target
+/dst/*
+/bk
+/crate
+/log/*.log
+crate/*/target

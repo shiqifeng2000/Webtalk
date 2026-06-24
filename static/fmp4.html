@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+    <video id="video" controls autoplay muted></video>
+
+    <script>
+        const video = document.getElementById('video');
+
+        const mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
+
+        mediaSource.addEventListener('sourceopen', () => {
+            const sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.4d4028, mp4a.40.2"');
+
+            // Fetch and append chunks
+            async function fetchAndAppend() {
+                const response = await fetch('/streamer/927323287?TOKEN=webtalk');
+                const reader = response.body.getReader();
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    sourceBuffer.appendBuffer(value);
+
+                    // Remove old data to prevent buffer overflow
+                    if (sourceBuffer.buffered.length > 0) {
+                        const end = sourceBuffer.buffered.end(0);
+                        const start = Math.max(0, end - 2); // Keep 2 seconds
+                        sourceBuffer.remove(start, end);
+                    }
+                }
+            }
+
+            fetchAndAppend();
+        });
+    </script>
+</body>
+
+</html>

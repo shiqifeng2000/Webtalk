@@ -1,0 +1,393 @@
+<html>
+
+<head></head>
+<style>
+  textarea {
+    width: 500px;
+    min-height: 75px;
+  }
+
+  .section {
+    /* font-size: 0; */
+    display: flex;
+  }
+
+  .section div {
+    flex: 1
+  }
+
+  .section video {
+    /* width: 100%; */
+    width: 50vw;
+    height: auto;
+  }
+
+  body {
+    padding: 0;
+    margin: 0;
+  }
+</style>
+
+<body>
+  <!-- Browser base64 Session Description<br />
+    <textarea id="localSessionDescription" readonly="true"></textarea> <br />
+
+    Golang base64 Session Description<br />
+    <textarea id="remoteSessionDescription"> </textarea> <br />
+    <button onclick="window.startSession()">Start Session</button><br />
+
+    <br /> -->
+
+  <!-- <video id="remoteVideos" autoplay muted controls style="width: 100%; height: 50%px"></video> -->
+  <section class="section">
+    <div>
+      <h4>Local Video</h4>
+      <video id="localVideo" autoplay controls muted></video>
+    </div>
+    <div id="section">
+      <h4>Remote Video</h4>
+      <!-- <video id="remoteVideo1" autoplay muted controls></video> -->
+    </div>
+  </section>
+  <br />
+  操作区
+  <form onsubmit="return sendMessage()">
+    <input id="target" />
+    <button type="button" onclick="return peer(true)" id="offerBtn">注册设备</button>
+    <button type="button" onclick="return peer()" id="answerBtn">发起连接</button>
+    <button type="button" onclick="return breakPeer()" id="resetBtn">重置连接</button>
+  </form>
+  <br />
+  <!-- 计时器<br />
+  <div id="timer"></div> -->
+  当前会话<br />
+  <div id="sessions"></div>
+  <br />
+
+  日志<br />
+  <div id="div"></div>
+</body>
+<script>
+  /* eslint-env browser */
+  let start_time = Date.now();
+  const localVideo = document.getElementById('localVideo');
+  // const remoteVideo1 = document.getElementById('remoteVideo1');
+  const targetInput = document.getElementById("target");
+  const offerBtn = document.getElementById('offerBtn');
+  const answerBtn = document.getElementById('answerBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  let video = null;
+  let log = (msg) => {
+    document.getElementById("div").innerHTML += msg + "<br>";
+  };
+
+  const socket = new WebSocket(`wss://10.10.87.239:10001/ws`);
+
+  offerBtn.disabled = false;
+  answerBtn.disabled = false;
+  resetBtn.disabled = true;
+
+  let sessionId = null;
+  let localSdp = null;
+  let remoteSdp = null;
+  let localCandidates = [];
+  let remoteCandidates = [];
+  let sessions = {};
+  let localStream = null;
+
+  let target = null;
+  // let socketReadyRes = null;
+  let socketReady = new Promise((res, rej) => {
+    socket.onopen = () => {
+      res();
+      console.log("websocket opened");
+    }
+    // socketReadyRes = res;
+    socket.onerror = (e) => {
+      console.log("websocket error");
+      rej(e.message);
+    }
+  });
+
+  let remoteSdpRes = null;
+  let remoteSdpGot = new Promise((res, rej) => {
+    remoteSdpRes = res;
+  });
+
+  // let answerGotRes = null;
+  // let answerGot = new Promise((res, rej) => {
+  //   answerGotRes = res;
+  // });
+
+  let localGatherRes = null;
+  let localGather = new Promise((res, rej) => {
+    localGatherRes = res;
+  });
+
+  async function getVideoAudioTrack(pc) {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: true
+    });
+    localVideo.srcObject = localStream;
+    localStream.getTracks().forEach(track => {
+      // track.contentHint = "detail";
+      pc.addTrack(track, localStream);
+    });
+  }
+  window.resetPc = () => {
+    sessionId = null;
+    localSdp = null;
+    remoteSdp = null;
+    localCandidates = [];
+    remoteCandidates = [];
+    sessions = {};
+    target = null;
+    remoteSdpRes = null;
+    remoteSdpGot = new Promise((res, rej) => {
+      remoteSdpRes = res;
+    });
+    localGatherRes = null;
+    localGather = new Promise((res, rej) => {
+      localGatherRes = res;
+    });
+    if (video && video.parentElement) {
+      video.parentElement.removeChild(video);
+    }
+    video = null;
+    localStream.getTracks().forEach(track => {
+      localStream.removeTrack(track);
+    });
+    localStream = null;
+    localVideo.srcObject = null;
+    offerBtn.disabled = false;
+    answerBtn.disabled = false;
+    resetBtn.disabled = true;
+  }
+  socket.onmessage = evt => {
+    let data = JSON.parse(evt.data);
+    if (data.type === "sessions") {
+      if (sessions.length == data.sessions.length) {
+        let ls_diff = false;
+        let rs_diff = false;
+        for (let ls of Object.keys(sessions)) {
+          if (!data.sessions.hasOwnProperty(ls)) {
+            ls_diff = true;
+            break;
+          }
+        }
+        if (!ls_diff) {
+          for (let rs of Object.keys(data.sessions)) {
+            if (!sessions.hasOwnProperty(rs)) {
+              rs_diff = true;
+              break;
+            }
+          }
+        }
+        if (ls_diff || rs_diff) {
+          sessions = data.sessions;
+          document.getElementById("sessions").innerHTML = Object.keys(sessions).join(", ");
+        }
+      } else {
+        sessions = data.sessions;
+        document.getElementById("sessions").innerHTML = Object.keys(sessions).join(", ");
+      }
+    } else if (data.type === "iceCandidate") {
+      console.log("remote candidate", data);
+      remoteCandidates.push(data);
+    } else if (data.type === "answer") {
+      console.log("remote answer", data);
+      remoteSdp = data;
+      remoteSdpRes(data);
+    } else if (data.type === "init") {
+      console.log("session created", data);
+      sessionId = data.id;
+    } else if (data.type === "talkstop") {
+      log(`通信已终止，原因 ${data.message}`);
+      if (window.pc) {
+        window.pc.close();
+        delete window.pc;
+        window.resetPc();
+      }
+    }
+  }
+
+
+  function deCode(ArrayBuffer) {
+    var utf8 = new Uint8Array(ArrayBuffer);
+    var deCodeUtf = new TextDecoder()
+    return data = deCodeUtf.decode(utf8);
+  };
+
+  window.peer = async (offer) => {
+    // if (offer) {
+    //   offerBtn.disabled = true;
+    //   answerBtn.disabled = true;
+    // } else {
+    //   answerBtn.disabled = true;
+    // }
+    await socketReady;
+    if (!offer) {
+      target = Number.parseInt(targetInput.value);
+      if (!target || !sessions.hasOwnProperty(target)) {
+        alert("Target number invalid");
+        window.resetPc();
+        return;
+      }
+    }
+    offerBtn.disabled = true;
+    answerBtn.disabled = true;
+    resetBtn.disabled = false;
+    let pc = new RTCPeerConnection({
+      iceServers: [
+        {
+          // urls: "stun:stun.l.google.com:19302",
+          // urls: "stun:10.10.87.239:9003",
+          urls: "stun:10.10.87.239:10101",
+          // username: "robin",
+          // credential: "12345"
+        },
+      ],
+    });
+    video = document.createElement("video");
+    video.autoplay = true;
+    video.controls = true;
+    video.muted = true;
+    section.appendChild(video);
+    await getVideoAudioTrack(pc);
+
+    let mediaStream = new MediaStream();
+    video.srcObject = mediaStream;
+    let start_time = Date.now();
+    video.onplaying = () => {
+      log(`播放中，初始化总耗时 ${Date.now() - start_time} ms`);
+      // if (transformBtn.disabled) {
+      //   transformBtn.disabled = false;
+      // }
+    }
+    pc.ontrack = function (event) {
+      let remoteStreams = event.streams;
+      log(`track ${event.track.kind} received ${event.track.id}`);
+      mediaStream.addTrack(event.track);
+    };
+    pc.oniceconnectionstatechange = (e) => {
+      log(pc.iceConnectionState);
+      if (pc.iceConnectionState === "connected") {
+        console.log(Date.now() - start_time);
+      }
+    };
+    pc.onicegatheringstatechange = (e) =>
+      console.log("onicegatheringstatechange", e);
+    pc.onnegotiationneeded = (e) => console.log("onnegotiationneeded", e);
+    pc.onsignalingstatechange = (e) => {
+      console.log("onsignalingstatechange", e);
+    };
+    // Offer to receive 1 audio, and 1 video track
+    // pc.addTransceiver("video", { direction: "sendrecv" });
+    pc.addTransceiver("video", { direction: "sendrecv" });
+    pc.addTransceiver("audio", { direction: "sendrecv", });
+    pc.onclose = () => {
+      console.log("pc has closed");
+    }
+    pc.onicecandidate = (e) => {
+      const message = {
+        type: 'iceCandidate',
+        candidate: null,
+      };
+      console.log("local candidate", message);
+      if (e.candidate) {
+        message.candidate = e.candidate;
+        // message.candidate = e.candidate.candidate;
+        // message.sdpMid = e.candidate.sdpMid;
+        // message.sdpMLineIndex = e.candidate.sdpMLineIndex;
+        console.log("local candidate", message);
+        // localCandidates.push(JSON.stringify(message));
+        socket.send(JSON.stringify(message));
+      } else {
+        localGatherRes();
+      }
+    };
+
+    if (offer) {
+      let d = await pc.createOffer();
+      console.log("local offer", d.sdp);
+      socket.send(JSON.stringify({ type: d.type, sdp: d.sdp }));
+      let answer = await remoteSdpGot;
+
+      await pc.setLocalDescription(d);
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+      // for (let item in localCandidates) {
+      //   socket.send(JSON.stringify(item));
+      // }
+      // localCandidates.splice(0);
+      // await Promise.race([localGather, new Promise(res => {
+      //   setTimeout(res, 1000);
+      // })]);
+      // setTimeout(() => {
+      //   socket.send(JSON.stringify({
+      //     type: 'iceCandidate',
+      //     candidate: null,
+      //   }));
+      // }, 2000);
+
+    } else {
+      let session = sessions[target];
+      if (!session) {
+        alert("no such session!");
+        return;
+      }
+      let offer = session.offer;
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: offer }));
+      let d = await pc.createAnswer();
+      console.log("local answer", d.sdp);
+      await pc.setLocalDescription(d);
+
+      socket.send(JSON.stringify({ sid: target, type: d.type, sdp: d.sdp }));
+    }
+    setTimeout(() => {
+      socket.send(JSON.stringify({
+        type: 'iceCandidate',
+        candidate: null,
+      }));
+    }, 2000);
+    let startInter = Date.now();
+    let inter = setInterval(() => {
+      if (Date.now() - startInter > 2000) {
+        clearInterval(inter);
+      } else {
+        let terminate = false;
+        while (data = remoteCandidates.splice(0, 1)) {
+          if (data.length === 0) {
+            break;
+          }
+          pc.addIceCandidate(data[0].candidate);
+          if (data[0].candidate === null) {
+            terminate = true;
+          }
+        }
+        if (terminate) {
+          clearInterval(inter);
+        }
+      }
+    }, 100);
+
+    if (!window.pc) {
+      window.pc = pc;
+    }
+
+  }
+
+  window.breakPeer = () => {
+    if (window.pc) {
+      socket.send(JSON.stringify({ type: "talkstop", sid: sessionId }));
+      window.pc.close();
+      delete window.pc;
+      window.resetPc();
+    }
+  }
+
+</script>
+
+</html>
