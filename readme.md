@@ -9,7 +9,7 @@
 
 ## 🚀 Overview
 
-WebTalk is a full-featured real-time media streaming and conferencing framework that supports both **SFU (Selective Forwarding Unit)** and **P2P (Peer-to-Peer)** modes. It bridges WebRTC, RTMP, and HTTP ecosystems with a clean, extensible architecture — perfect for web-based video conferencing, live broadcasting, and real-time collaboration platforms.
+WebTalk is a full-featured real-time media streaming and conferencing framework that supports both **SFU (Selective Forwarding Unit)** and **P2P (Peer-to-Peer)** modes. It bridges WebRTC, RTMP(TODO), and HTTP ecosystems with a clean, extensible architecture — perfect for web-based video conferencing, live broadcasting, and real-time collaboration platforms.
 
 ---
 
